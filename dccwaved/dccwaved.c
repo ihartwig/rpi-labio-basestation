@@ -84,6 +84,8 @@
 #define PCM_PHYS_BASE   (periph_phys_base + PCM_BASE_OFFSET)
 #define GPIO_PHYS_BASE    (periph_phys_base + GPIO_BASE_OFFSET)
 
+#define BUS_TO_PHYS(x) ((x)&~0xC0000000)
+
 // DMA Control Block Transfer Information
 #define DMA_NO_WIDE_BURSTS  (1<<26)
 #define DMA_WAIT_RESP   (1<<3)
@@ -168,11 +170,70 @@
 #define ROUNDUP(val, blksz) (((val)+((blksz)-1)) & ~(blksz-1))
 
 typedef struct {
-  uint32_t info, src, dst, length,
-     stride, next, pad[2];
+  uint32_t info;
+  uint32_t src;
+  uint32_t dst;
+  uint32_t length;
+  uint32_t stride;
+  uint32_t next;
+  uint32_t pad[2];
 } dma_cb_t;
 
-#define BUS_TO_PHYS(x) ((x)&~0xC0000000)
+// DCC Packet Structure
+#define DCC_ADDR_IDLE        (0xFF)
+#define DCC_ADDR_LONG        (0x3<<6)
+#define DCC_ADDR_LONG_MAX    (0x3FFF)
+#define DCC_ADDR_SHORT_MAX   (0x7F)  // 127
+#define DCC_CMD_IDLE         (0x0<<5)
+#define DCC_CMD_SPD_DIR_REV  (0x2<<5)
+#define DCC_CMD_SPD_DIR_FWD  (0x3<<5)
+#define DCC_CMD_SPD_EXT      ((0x1<<5)|0x1F)  // 128 step mode
+#define DCC_CMD_FN_GP_1      (0x4<<5)
+#define DCC_CMD_FN_GP_2      (0x5<<5)
+#define DCC_CMD_FN_GP_3      ((0x5<<5)|(0x1<<4))  // call it gp 3 for f9-12
+#define DCC_CMD_FN_MASK      (0xF<<4)
+#define DCC_CMD_MASK         (0x7<<5)
+#define DCC_VAL_IDLE         (0x0)
+#define DCC_VAL_MODE_REG     0
+#define DCC_VAL_MODE_EXT     1
+#define DCC_VAL_SPD_MASK     (0x0F) // only use the last 4 bits for 14 step mode
+
+// DCC Line Coding
+// 1 = 58us high, 58us low = 0b10
+// 0 = 100+us high, 100+us low = 0b1100
+// MSB is first bit transmitted
+// MSB is first bit serialized by RPi PWM 
+//   (the 0x0F in 0x0F070301 is sent on the line first)
+#define DCC_CODE_ONE         (0x2)
+#define DCC_CODE_ONE_LEN     2
+#define DCC_CODE_ZERO        (0xC)
+#define DCC_CODE_ZERO_LEN    4
+// longest packet we support has 210 bits encoded (no 3 byte inst)
+// 11_1111_1111 0 0000_0000 0 0000_0000 0 0000_0000 0 00000_0000 0 00000_0000 1
+// preamble       addr1       addr2       inst1       inst2        chk_sum
+#define DCC_CODE_UI32_LEN     7  // 224 bits
+#define DCC_PCK_UI8_LEN       5  // uncoded packet length
+
+// DCC Intermediate Encoding
+// fixed-length definition for 
+typedef struct {
+  uint16_t addr;
+  uint8_t cmd;
+  uint8_t pad1;
+  uint16_t val;
+  uint8_t val_mode;
+  uint8_t chk_sum;
+  uint32_t line_code[DCC_CODE_UI32_LEN];
+} dcc_pkt_t;
+
+// DMAable DCC Entry
+#define DCC_DMA_BUF_LEN 64  // assuming ~120msg/s this gives ~.5s latency max
+typedef struct {
+  dma_cb_t dma_cb;  // first as must be 32-byte aligned
+  dcc_pkt_t dcc_pkt;
+  uint32_t next_id;  // for id-based linked list
+} dcc_dma_entry_t;
+
 
 /* Define which P1 header pins to use by default.  These are the eight standard
  * GPIO pins (those coloured green in the diagram on this page:
@@ -345,7 +406,6 @@ static int invert = 0;
 static int num_samples;
 static int num_cbs;
 static int num_pages;
-static dma_cb_t *cb_base;
 
 static int board_model;
 static int gpio_cfg;
@@ -369,8 +429,18 @@ static struct {
   unsigned bus_addr;  /* From mem_lock() */
   uint8_t *virt_addr; /* From mapmem() */
 } mbox;
+
+static dcc_pkt_t dcc_pkt_tmp;
+static uint32_t dcc_dma_next_id = 0;
+
   
 static void gpio_set_mode(uint32_t gpio, uint32_t mode);
+static void dma_update_cb(dma_cb_t *cb, dma_cb_t *next_cb);
+static void dcc_make_line_code(dcc_pkt_t *pkt);
+static void dcc_dma_update(dcc_dma_entry_t *dcc_dma_buf, dcc_pkt_t tmp_pkt);
+static void dcc_dma_init(dcc_dma_entry_t *dcc_dma_buf);
+static void dcc_dma_hw_config();
+
 
 static void
 udelay(int us)
@@ -491,22 +561,189 @@ setup_sighandlers(void)
   }
 }
 
-static void init_ctrl_data(void)
+static void
+dma_update_cb(dma_cb_t *cb, dma_cb_t *next_cb)
 {
-  dma_cb_t *cbp = cb_base;
   uint32_t phys_fifo_addr;
-  phys_fifo_addr = PWM_PHYS_BASE + (PWM_FIFO*4);
+  phys_fifo_addr = PWM_PHYS_BASE + (PWM_FIFO*sizeof(uint32_t));
+  cb->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(5) | DMA_TDMODE;
+  cb->src = mem_virt_to_phys(cb+1);
+  cb->dst = phys_fifo_addr;
+  // copy whole dcc packet to fifo at once
+  cb->length = DMA_TD_LEN(sizeof(uint32_t), DCC_CODE_UI32_LEN);
+  // inc source addr (buffer) but not dest (fifo)
+  cb->stride = DMA_STRIDE(sizeof(uint32_t), 0);
+  cb->next = mem_virt_to_phys(next_cb);
+}
 
-  cbp->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(5) | DMA_TDMODE;
-  cbp->src = mem_virt_to_phys(cbp+1);
-  cbp->dst = phys_fifo_addr;
-  cbp->length = DMA_TD_LEN(4,6);  // 6 transfers of a uint32_t
-  cbp->stride = DMA_STRIDE(4,0);  // inc source addr (buffer) but not dest (fifo)
-  cbp->next = mem_virt_to_phys(cbp);  // repeat forever
+static inline int
+dcc_cmd_is_spd(uint8_t cmd) {
+  return (cmd == DCC_CMD_SPD_DIR_REV || cmd == DCC_CMD_SPD_DIR_FWD);
+}
+
+static inline int
+dcc_cmd_is_func(uint8_t cmd) {
+  return ((cmd & DCC_CMD_MASK) == DCC_CMD_FN_GP_1 ||
+          (cmd & DCC_CMD_MASK) == DCC_CMD_FN_GP_2);
 }
 
 static void
-init_hardware(void)
+dcc_make_line_code(dcc_pkt_t *pkt)
+{
+  // calculate contents
+  int pkt_code_len = 0;
+  uint8_t pkt_code[DCC_PCK_UI8_LEN];
+  // short addr
+  if (pkt->addr < DCC_ADDR_SHORT_MAX || pkt->addr == DCC_ADDR_IDLE) {
+    pkt_code[pkt_code_len] = pkt->addr;
+    pkt_code_len++;
+  }
+  // long addr (up to 14 bit) with msb in the first byte bit 5
+  else {
+    pkt_code[pkt_code_len] = DCC_ADDR_LONG |
+      ((pkt->addr & DCC_ADDR_LONG_MAX) >> sizeof(uint8_t));
+    pkt_code_len++;
+    pkt_code[pkt_code_len] = (uint8_t) pkt->addr;
+    pkt_code_len++;
+  }
+  // short speed commands
+  if (dcc_cmd_is_spd(pkt->cmd) && pkt->val_mode == DCC_VAL_MODE_REG) {
+    pkt_code[pkt_code_len] = pkt->cmd | (pkt->val & DCC_VAL_SPD_MASK);
+    pkt_code_len++;
+  }
+  // long speed commands
+  else if (dcc_cmd_is_spd(pkt->cmd)) {
+    pkt_code[pkt_code_len] = DCC_CMD_SPD_EXT;  // TODO encode direction
+    pkt_code_len++;
+    pkt_code[pkt_code_len] = pkt->val;
+    pkt_code_len++;
+  }
+  else if (dcc_cmd_is_func(pkt->cmd)) {
+    pkt_code[pkt_code_len] = pkt->cmd;  // TODO
+    pkt_code_len++;
+  }
+  else {
+    pkt_code[pkt_code_len] = DCC_CMD_IDLE;
+    pkt_code_len++;
+  }
+  // xor check sum
+  for (int i=0; i < pkt_code_len; i++) {
+    pkt_code[pkt_code_len] ^= pkt_code[i];
+  }
+  pkt_code_len++;
+  // write out the line code
+  memset(&(pkt->line_code), 0, sizeof(pkt->line_code));
+  int line_code_idx, line_code_shift, pkt_code_idx, pkt_code_shift;
+  int bits_per_line = sizeof(uint32_t) * 8;
+  int pkt_bits_rem = pkt_code_len * sizeof(uint32_t);
+  int line_bits_rem = sizeof(pkt->line_code);
+  for (; pkt_bits_rem > 0; pkt_bits_rem--) {
+    // start from last bit to send since line code is variable length
+    line_code_idx = line_bits_rem / bits_per_line;
+    line_code_shift = line_bits_rem - (line_code_idx * bits_per_line);
+    pkt_code_idx = pkt_bits_rem / bits_per_line;
+    pkt_code_shift = pkt_bits_rem - (pkt_code_idx * bits_per_line);
+    if(pkt_code[pkt_code_idx] >> pkt_code_shift == 1) {
+      pkt->line_code[line_code_idx] |= (DCC_CODE_ONE << line_code_shift);
+      line_bits_rem -= DCC_CODE_ONE_LEN;
+    }
+    else {
+      pkt->line_code[line_code_idx] |= (DCC_CODE_ZERO << line_code_shift);
+      line_bits_rem -= DCC_CODE_ZERO_LEN;
+      // TODO what about when this has to carry over
+    }
+  }
+  for (; line_bits_rem > 0; line_bits_rem--) {
+    // and fill the rest of the buffer with 1s, which includes the preamble
+    pkt->line_code[line_code_idx] |= (DCC_CODE_ONE << line_code_shift);
+    line_bits_rem -= DCC_CODE_ONE_LEN;
+  }
+}
+
+static inline int
+dcc_cmd_func_group(uint8_t cmd) {
+  if ((cmd & DCC_CMD_MASK) == DCC_CMD_FN_GP_1) {
+    return 1;
+  }
+  else if ((cmd & DCC_CMD_MASK) == DCC_CMD_FN_GP_2) {
+    if ((cmd & DCC_CMD_FN_MASK) == DCC_CMD_FN_GP_3) {
+      return 3;
+    }
+    else {
+      return 2;
+    }
+  }
+  else {
+    return 0;
+  }
+}
+
+static void
+dcc_dma_update(dcc_dma_entry_t *dcc_dma_buf, dcc_pkt_t tmp_pkt) {
+  int prev_id = 0;
+  int this_id = 0;
+  // look for matching addr and command
+  // also keep track of previous entry
+  for (int i=0; i < dcc_dma_next_id; i++) {
+    if (dcc_dma_buf[i].dcc_pkt.addr == tmp_pkt.addr) {
+      uint8_t this_cmd = dcc_dma_buf[i].dcc_pkt.cmd;
+      uint8_t tmp_cmd = tmp_pkt.cmd;
+      // matching command details
+      if ((dcc_cmd_is_spd(tmp_cmd) && dcc_cmd_is_spd(this_cmd)) ||
+          dcc_cmd_func_group(tmp_cmd) == dcc_cmd_func_group(this_cmd)) {
+        this_id = i;
+      }
+    }
+    prev_id = i;
+  }
+
+  // insert new when we can't find a match
+  if (this_id == dcc_dma_next_id) {
+    // make sure there's room
+    if(dcc_dma_next_id == DCC_DMA_BUF_LEN) {
+      return;
+    }
+    // prepare entry
+    dcc_dma_buf[this_id].dcc_pkt = tmp_pkt;
+    dcc_make_line_code(&(dcc_dma_buf[this_id].dcc_pkt));
+    dcc_dma_buf[this_id].next_id = 0;  // always add to end wrapping around
+    dcc_dma_buf[prev_id].next_id = this_id;
+    dma_update_cb(&(dcc_dma_buf[this_id].dma_cb),
+                  &(dcc_dma_buf[0].dma_cb));
+    dma_update_cb(&(dcc_dma_buf[prev_id].dma_cb),
+                  &(dcc_dma_buf[this_id].dma_cb));
+    dcc_dma_next_id++;
+  }
+
+  // remove, update, reinsert from dma if matched
+  else {
+    uint32_t next_id = dcc_dma_buf[this_id].next_id;
+    dma_update_cb(&(dcc_dma_buf[prev_id].dma_cb),
+                  &(dcc_dma_buf[next_id].dma_cb));
+    // now safe, update entry
+    dcc_dma_buf[this_id].dcc_pkt = tmp_pkt;
+    dcc_make_line_code(&(dcc_dma_buf[this_id].dcc_pkt));
+    // reinsert
+    dma_update_cb(&(dcc_dma_buf[prev_id].dma_cb),
+                  &(dcc_dma_buf[this_id].dma_cb));
+  }
+}
+
+static void
+dcc_dma_init(dcc_dma_entry_t *dcc_dma_buf)
+{
+  // zero dma chain
+  memset(dcc_dma_buf, 0, sizeof(dcc_dma_entry_t)*DCC_DMA_BUF_LEN);
+  // make idle to start off the dma chain
+  dcc_pkt_t tmp_pkt;
+  tmp_pkt.addr = DCC_ADDR_IDLE;
+  tmp_pkt.cmd = DCC_CMD_IDLE;
+  tmp_pkt.val = DCC_VAL_IDLE;
+  dcc_dma_update(dcc_dma_buf, tmp_pkt);
+}
+
+static void
+dcc_dma_hw_config(dcc_dma_entry_t *dcc_dma_buf)
 {
   // Initialise PWM
   if (pwm_reg[PWM_CTL] & PWMCTL_PWEN1) {
@@ -539,7 +776,7 @@ init_hardware(void)
   dma_reg[DMA_CS] = DMA_RESET;
   udelay(10);
   dma_reg[DMA_CS] = DMA_INT | DMA_END;
-  dma_reg[DMA_CONBLK_AD] = mem_virt_to_phys(cb_base);
+  dma_reg[DMA_CONBLK_AD] = mem_virt_to_phys(&(dcc_dma_buf->dma_cb));
   dma_reg[DMA_DEBUG] = 7; // clear debug error flags
   dma_reg[DMA_CS] = 0x10880001; // go, mid priority, wait for outstanding writes
 }
@@ -827,6 +1064,12 @@ get_model_and_revision(void)
 int
 main(int argc, char **argv)
 {
+  // dcc dma output chain
+  dcc_pkt_t dcc_pkt_tmp;
+  int dcc_dma_next_id = 0;
+  dcc_dma_entry_t *dcc_dma_head;
+
+  // program options
   int i;
   char *p1pins = default_p1_pins;
   char *p5pins = default_p5_pins;
@@ -836,8 +1079,8 @@ main(int argc, char **argv)
   int daemonize = 1;
   is_debug = 0;
 
+  /* Option processing */
   setvbuf(stdout, NULL, _IOLBF, 0);
-
   while (1) {
     int c;
     int option_index;
@@ -888,7 +1131,7 @@ main(int argc, char **argv)
 
   num_samples = cycle_time_us / step_time_us;
   num_cbs =     num_samples * 2 + MAX_SERVOS;
-  num_pages =   (num_cbs * sizeof(dma_cb_t) + num_samples * 4 +
+  num_pages =   (num_cbs * sizeof(dma_cb_t) + num_samples * 4 +   // TODO: fix
         MAX_SERVOS * 4 + PAGE_SIZE - 1) >> PAGE_SHIFT;
 
   if (num_pages > MAX_MEMORY_USAGE / PAGE_SIZE) {
@@ -935,6 +1178,7 @@ main(int argc, char **argv)
     fatal("Failed to lock memory\n");
   }
   mbox.virt_addr = mapmem(BUS_TO_PHYS(mbox.bus_addr), mbox.size);
+  dcc_dma_head = (dcc_dma_entry_t *)mbox.virt_addr;
 
   // turnoff_mask = (uint32_t *)mbox.virt_addr;
   // turnon_mask = (uint32_t *)(mbox.virt_addr + num_samples * sizeof(uint32_t));
@@ -942,29 +1186,22 @@ main(int argc, char **argv)
   //   ROUNDUP(num_samples + MAX_SERVOS, 8) * sizeof(uint32_t));
 
   // put dma control block at the beginning of new block
-  cb_base = (dma_cb_t *)(mbox.virt_addr);
-  // and pwm serializer data just after
-  uint32_t *pwm_ser_base;
-  pwm_ser_base = (uint32_t *)(cb_base+1);
-  pwm_ser_base[0] = 0x0F0F0F0F;
-  pwm_ser_base[1] = 0x0F070301;
-  pwm_ser_base[2] = 0x05155555;
-  pwm_ser_base[3] = 0x01234567;
-  pwm_ser_base[4] = 0x89ABCDEF;
-  pwm_ser_base[5] = 0x0103070F;
+  // cb_base = (dma_cb_t *)(mbox.virt_addr);
+  // // and pwm serializer data just after
+  // uint32_t *pwm_ser_base;
+  // pwm_ser_base = (uint32_t *)(cb_base+1);
+  // pwm_ser_base[0] = 0x0F0F0F0F;
+  // pwm_ser_base[1] = 0x0F070301;
+  // pwm_ser_base[2] = 0x05155555;
+  // pwm_ser_base[3] = 0x01234567;
+  // pwm_ser_base[4] = 0x89ABCDEF;
+  // pwm_ser_base[5] = 0x0103070F;
 
+  // init_ctrl_data();
 
-  for (i = 0; i < MAX_SERVOS; i++) {
-    if (servo2gpio[i] == DMY)
-      continue;
-    gpiomode[i] = gpio_get_mode(servo2gpio[i]);
-    gpio_set(servo2gpio[i], invert ? 1 : 0);
-    gpio_set_mode(servo2gpio[i], GPIO_MODE_OUT);
-  }
-  restore_gpio_modes = 1;
-
-  init_ctrl_data();
-  init_hardware();
+  /* Start DMA hardware */
+  dcc_dma_init(dcc_dma_head);
+  dcc_dma_hw_config(dcc_dma_head);
 
   unlink(DEVFILE);
   if (mkfifo(DEVFILE, 0666) < 0)
