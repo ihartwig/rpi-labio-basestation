@@ -56,6 +56,7 @@
 
 #define PAGE_SIZE   4096
 #define PAGE_SHIFT    12
+#define BITS_IN_BYTE  8
 
 #define DMA_CHAN_SIZE   0x100
 #define DMA_CHAN_MIN    0
@@ -207,7 +208,7 @@ typedef struct {
 #define DCC_CODE_ONE         (0x2)
 #define DCC_CODE_ONE_LEN     2
 #define DCC_CODE_ZERO        (0xC)
-#define DCC_CODE_ZERO_LEN    4
+#define DCC_CODE_ZERO_LEN    4  // line coder only handles when this is 2x one
 // longest packet we support has 210 bits encoded (no 3 byte inst)
 // 11_1111_1111 0 0000_0000 0 0000_0000 0 0000_0000 0 00000_0000 0 00000_0000 1
 // preamble       addr1       addr2       inst1       inst2        chk_sum
@@ -435,7 +436,8 @@ static uint32_t dcc_dma_next_id = 0;
 
   
 static void gpio_set_mode(uint32_t gpio, uint32_t mode);
-static void dma_update_cb(dma_cb_t *cb, dma_cb_t *next_cb);
+static void dcc_dma_make_cb(
+  dcc_dma_entry_t *dcc_dma_buf, int this_id, int next_id);
 static void dcc_make_line_code(dcc_pkt_t *pkt);
 static void dcc_dma_update(dcc_dma_entry_t *dcc_dma_buf, dcc_pkt_t tmp_pkt);
 static void dcc_dma_init(dcc_dma_entry_t *dcc_dma_buf);
@@ -562,12 +564,15 @@ setup_sighandlers(void)
 }
 
 static void
-dma_update_cb(dma_cb_t *cb, dma_cb_t *next_cb)
+dcc_dma_make_cb(dcc_dma_entry_t *dcc_dma_buf, int this_id, int next_id)
 {
+  dma_cb_t *cb = &(dcc_dma_buf[this_id].dma_cb);
+  uint32_t *line_code = &(dcc_dma_buf[this_id].dcc_pkt.line_code[0]);
+  dma_cb_t *next_cb = &(dcc_dma_buf[next_id].dma_cb);
   uint32_t phys_fifo_addr;
   phys_fifo_addr = PWM_PHYS_BASE + (PWM_FIFO*sizeof(uint32_t));
   cb->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(5) | DMA_TDMODE;
-  cb->src = mem_virt_to_phys(cb+1);
+  cb->src = mem_virt_to_phys(line_code);
   cb->dst = phys_fifo_addr;
   // copy whole dcc packet to fifo at once
   cb->length = DMA_TD_LEN(sizeof(uint32_t), DCC_CODE_UI32_LEN);
@@ -631,18 +636,25 @@ dcc_make_line_code(dcc_pkt_t *pkt)
     pkt_code[pkt_code_len] ^= pkt_code[i];
   }
   pkt_code_len++;
+  for (int i=0; i < pkt_code_len; i++) {
+    printf("pkt_code[%d]: 0x%x\n", i, pkt_code[i]);
+  }
   // write out the line code
   memset(&(pkt->line_code), 0, sizeof(pkt->line_code));
   int line_code_idx, line_code_shift, pkt_code_idx, pkt_code_shift;
-  int bits_per_line = sizeof(uint32_t) * 8;
-  int pkt_bits_rem = pkt_code_len * sizeof(uint32_t);
-  int line_bits_rem = sizeof(pkt->line_code);
+  int bits_per_word = sizeof(uint32_t) * BITS_IN_BYTE;
+  int pkt_bits_rem = sizeof(pkt_code) * BITS_IN_BYTE;
+  int line_bits_rem = sizeof(pkt->line_code) * BITS_IN_BYTE;
   for (; pkt_bits_rem > 0; pkt_bits_rem--) {
     // start from last bit to send since line code is variable length
-    line_code_idx = line_bits_rem / bits_per_line;
-    line_code_shift = line_bits_rem - (line_code_idx * bits_per_line);
-    pkt_code_idx = pkt_bits_rem / bits_per_line;
-    pkt_code_shift = pkt_bits_rem - (pkt_code_idx * bits_per_line);
+    // use integer div with offset as floor
+    line_code_idx = (line_bits_rem - 1) / bits_per_word;
+    line_code_shift = ((line_code_idx + 1) * bits_per_word) - line_bits_rem;
+    pkt_code_idx = (pkt_bits_rem - 1) / BITS_IN_BYTE;
+    pkt_code_shift = ((pkt_code_idx + 1) * BITS_IN_BYTE) - pkt_bits_rem;
+    printf("pkt_bits_rem: %d\n", pkt_bits_rem);
+    printf("line_code_idx: %d\n", line_code_idx);
+    printf("line_code_shift: %d\n", line_code_shift);
     if(pkt_code[pkt_code_idx] >> pkt_code_shift == 1) {
       pkt->line_code[line_code_idx] |= (DCC_CODE_ONE << line_code_shift);
       line_bits_rem -= DCC_CODE_ONE_LEN;
@@ -650,11 +662,17 @@ dcc_make_line_code(dcc_pkt_t *pkt)
     else {
       pkt->line_code[line_code_idx] |= (DCC_CODE_ZERO << line_code_shift);
       line_bits_rem -= DCC_CODE_ZERO_LEN;
-      // TODO what about when this has to carry over
+      // also handle carry over of longer zeros
+      int carry_shift = bits_per_word - line_code_shift;
+      if (carry_shift < DCC_CODE_ZERO_LEN) {
+        pkt->line_code[line_code_idx-1] |= (DCC_CODE_ZERO >> carry_shift);
+      }
     }
   }
-  for (; line_bits_rem > 0; line_bits_rem--) {
+  for (; line_bits_rem > 0;) {
     // and fill the rest of the buffer with 1s, which includes the preamble
+    line_code_idx = (line_bits_rem - 1) / bits_per_word;
+    line_code_shift = ((line_code_idx + 1) * bits_per_word) - line_bits_rem;
     pkt->line_code[line_code_idx] |= (DCC_CODE_ONE << line_code_shift);
     line_bits_rem -= DCC_CODE_ONE_LEN;
   }
@@ -684,48 +702,53 @@ dcc_dma_update(dcc_dma_entry_t *dcc_dma_buf, dcc_pkt_t tmp_pkt) {
   int this_id = 0;
   // look for matching addr and command
   // also keep track of previous entry
-  for (int i=0; i < dcc_dma_next_id; i++) {
-    if (dcc_dma_buf[i].dcc_pkt.addr == tmp_pkt.addr) {
-      uint8_t this_cmd = dcc_dma_buf[i].dcc_pkt.cmd;
+  for (; this_id < dcc_dma_next_id; this_id++) {
+    if (dcc_dma_buf[this_id].dcc_pkt.addr == tmp_pkt.addr) {
+      uint8_t this_cmd = dcc_dma_buf[this_id].dcc_pkt.cmd;
       uint8_t tmp_cmd = tmp_pkt.cmd;
       // matching command details
       if ((dcc_cmd_is_spd(tmp_cmd) && dcc_cmd_is_spd(this_cmd)) ||
           dcc_cmd_func_group(tmp_cmd) == dcc_cmd_func_group(this_cmd)) {
-        this_id = i;
+        break;
       }
     }
-    prev_id = i;
+    prev_id = this_id;
   }
 
   // insert new when we can't find a match
   if (this_id == dcc_dma_next_id) {
     // make sure there's room
-    if(dcc_dma_next_id == DCC_DMA_BUF_LEN) {
+    if (dcc_dma_next_id == DCC_DMA_BUF_LEN) {
+      if (is_debug) {
+        printf("DCC DMA command buffer out of room!");
+      }
       return;
+    }
+    if (is_debug) {
+      printf("DCC DMA creating %d\n", this_id);
     }
     // prepare entry
     dcc_dma_buf[this_id].dcc_pkt = tmp_pkt;
     dcc_make_line_code(&(dcc_dma_buf[this_id].dcc_pkt));
     dcc_dma_buf[this_id].next_id = 0;  // always add to end wrapping around
     dcc_dma_buf[prev_id].next_id = this_id;
-    dma_update_cb(&(dcc_dma_buf[this_id].dma_cb),
-                  &(dcc_dma_buf[0].dma_cb));
-    dma_update_cb(&(dcc_dma_buf[prev_id].dma_cb),
-                  &(dcc_dma_buf[this_id].dma_cb));
+    dcc_dma_make_cb(dcc_dma_buf, this_id, 0);
+    dcc_dma_make_cb(dcc_dma_buf, prev_id, this_id);
     dcc_dma_next_id++;
   }
 
   // remove, update, reinsert from dma if matched
   else {
+    if (is_debug) {
+      printf("DCC DMA updating %d\n", this_id);
+    }
     uint32_t next_id = dcc_dma_buf[this_id].next_id;
-    dma_update_cb(&(dcc_dma_buf[prev_id].dma_cb),
-                  &(dcc_dma_buf[next_id].dma_cb));
+    dcc_dma_make_cb(dcc_dma_buf, prev_id, next_id);
     // now safe, update entry
     dcc_dma_buf[this_id].dcc_pkt = tmp_pkt;
     dcc_make_line_code(&(dcc_dma_buf[this_id].dcc_pkt));
     // reinsert
-    dma_update_cb(&(dcc_dma_buf[prev_id].dma_cb),
-                  &(dcc_dma_buf[this_id].dma_cb));
+    dcc_dma_make_cb(dcc_dma_buf, prev_id, this_id);
   }
 }
 
@@ -1067,7 +1090,7 @@ main(int argc, char **argv)
   // dcc dma output chain
   dcc_pkt_t dcc_pkt_tmp;
   int dcc_dma_next_id = 0;
-  dcc_dma_entry_t *dcc_dma_head;
+  dcc_dma_entry_t *dcc_dma_buf;
 
   // program options
   int i;
@@ -1129,11 +1152,8 @@ main(int argc, char **argv)
       fatal("Invalid dma-chan specified\n");
   }
 
-  num_samples = cycle_time_us / step_time_us;
-  num_cbs =     num_samples * 2 + MAX_SERVOS;
-  num_pages =   (num_cbs * sizeof(dma_cb_t) + num_samples * 4 +   // TODO: fix
-        MAX_SERVOS * 4 + PAGE_SIZE - 1) >> PAGE_SHIFT;
-
+  num_pages = (DCC_DMA_BUF_LEN * sizeof(dcc_dma_entry_t) +
+               PAGE_SIZE - 1) >> PAGE_SHIFT;
   if (num_pages > MAX_MEMORY_USAGE / PAGE_SIZE) {
     fatal("Using too much memory; reduce cycle-time or increase step-size\n");
   }
@@ -1178,7 +1198,7 @@ main(int argc, char **argv)
     fatal("Failed to lock memory\n");
   }
   mbox.virt_addr = mapmem(BUS_TO_PHYS(mbox.bus_addr), mbox.size);
-  dcc_dma_head = (dcc_dma_entry_t *)mbox.virt_addr;
+  dcc_dma_buf = (dcc_dma_entry_t *)mbox.virt_addr;
 
   // turnoff_mask = (uint32_t *)mbox.virt_addr;
   // turnon_mask = (uint32_t *)(mbox.virt_addr + num_samples * sizeof(uint32_t));
@@ -1200,8 +1220,21 @@ main(int argc, char **argv)
   // init_ctrl_data();
 
   /* Start DMA hardware */
-  dcc_dma_init(dcc_dma_head);
-  dcc_dma_hw_config(dcc_dma_head);
+  printf("Reserved %d pages at 0x%x\n", num_pages, (void *)dcc_dma_buf);
+  dcc_dma_init(dcc_dma_buf);
+  printf("%d: 0x%x -> 0x%x\n",
+         0,
+         mem_virt_to_phys(&(dcc_dma_buf[0].dma_cb)),
+         (uint32_t)dcc_dma_buf[0].dma_cb.next);
+  printf("0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n", 
+         dcc_dma_buf[0].dcc_pkt.line_code[0],
+         dcc_dma_buf[0].dcc_pkt.line_code[1],
+         dcc_dma_buf[0].dcc_pkt.line_code[2],
+         dcc_dma_buf[0].dcc_pkt.line_code[3],
+         dcc_dma_buf[0].dcc_pkt.line_code[4],
+         dcc_dma_buf[0].dcc_pkt.line_code[5],
+         dcc_dma_buf[0].dcc_pkt.line_code[6]);
+  dcc_dma_hw_config(dcc_dma_buf);
 
   unlink(DEVFILE);
   if (mkfifo(DEVFILE, 0666) < 0)
