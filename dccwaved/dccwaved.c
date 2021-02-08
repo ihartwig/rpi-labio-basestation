@@ -89,12 +89,16 @@
 
 // DMA Control Block Transfer Information
 #define DMA_NO_WIDE_BURSTS  (1<<26)
-#define DMA_WAIT_RESP   (1<<3)
-#define DMA_D_DREQ    (1<<6)
 #define DMA_PER_MAP(x)    ((x)<<16)
-#define DMA_TDMODE  (1<<1)
 #define DMA_TD_LEN(x,y)   (((y)<<16)|(x))
 #define DMA_STRIDE(s,d)   (((d)<<16)|(s))
+#define DMA_SRC_WIDTH   (1<<9)  // 1=128-bit, 0=32-bit
+#define DMA_SRC_INC     (1<<8)
+#define DMA_DEST_DREQ   (1<<6)
+#define DMA_DEST_WIDTH  (1<<5)  // 1=128-bit, 0=32-bit
+#define DMA_DEST_INC    (1<<4)
+#define DMA_WAIT_RESP   (1<<3)
+#define DMA_TDMODE      (1<<1)
 
 // DMA Control and Status (CS) Reg
 #define DMA_RESET   (1<<31)
@@ -571,13 +575,14 @@ dcc_dma_make_cb(dcc_dma_entry_t *dcc_dma_buf, int this_id, int next_id)
   dma_cb_t *next_cb = &(dcc_dma_buf[next_id].dma_cb);
   uint32_t phys_fifo_addr;
   phys_fifo_addr = PWM_PHYS_BASE + (PWM_FIFO*sizeof(uint32_t));
-  cb->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_D_DREQ | DMA_PER_MAP(5) | DMA_TDMODE;
+  cb->info = DMA_NO_WIDE_BURSTS | DMA_WAIT_RESP | DMA_DEST_DREQ;
+  // inc source addr (buffer) but not dest (fifo)
+  cb->info |= DMA_PER_MAP(5) | DMA_SRC_INC;
   cb->src = mem_virt_to_phys(line_code);
   cb->dst = phys_fifo_addr;
-  // copy whole dcc packet to fifo at once
-  cb->length = DMA_TD_LEN(sizeof(uint32_t), DCC_CODE_UI32_LEN);
-  // inc source addr (buffer) but not dest (fifo)
-  cb->stride = DMA_STRIDE(sizeof(uint32_t), 0);
+  // copy whole dcc packet to fifo
+  cb->length = sizeof(uint32_t) * DCC_CODE_UI32_LEN;
+  cb->stride = 0;
   cb->next = mem_virt_to_phys(next_cb);
 }
 
@@ -668,6 +673,7 @@ dcc_make_line_code(dcc_pkt_t *pkt)
         pkt->line_code[line_code_idx-1] |= (DCC_CODE_ZERO >> carry_shift);
       }
     }
+    // TODO: separator bits
   }
   for (; line_bits_rem > 0;) {
     // and fill the rest of the buffer with 1s, which includes the preamble
@@ -1226,7 +1232,7 @@ main(int argc, char **argv)
          0,
          mem_virt_to_phys(&(dcc_dma_buf[0].dma_cb)),
          (uint32_t)dcc_dma_buf[0].dma_cb.next);
-  printf("0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n", 
+  printf("0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n",
          dcc_dma_buf[0].dcc_pkt.line_code[0],
          dcc_dma_buf[0].dcc_pkt.line_code[1],
          dcc_dma_buf[0].dcc_pkt.line_code[2],
