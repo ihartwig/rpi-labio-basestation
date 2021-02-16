@@ -118,6 +118,7 @@
 #define DMA_DEBUG   (0x20/4)
 #define DMA_ENABLE  (0xff0/4)
 
+// GPIO Configration
 #define GPIO_FSEL0    (0x00/4)
 #define GPIO_SET0   (0x1c/4)
 #define GPIO_CLR0   (0x28/4)
@@ -134,20 +135,27 @@
 #define GPIO_MODE_ALT4  3
 #define GPIO_MODE_ALT5  2
 
+#define GPIO_FOR_MOT_IN4  18  // PWM0 on ATL5
+#define GPIO_FOR_MOT_IN3  19  // PWM1 on ALT5
+#define GPIO_FOR_MOT_ENB  13  // external PD
+
+// PWM Configuration
 #define PWM_CTL     (0x00/4)
 #define PWM_STA     (0x04/4)
 #define PWM_DMAC    (0x08/4)
 #define PWM_RNG1    (0x10/4)
 #define PWM_FIFO    (0x18/4)
 #define PWM_FIFO_WIDTH  32
+#define PWM_FIFO_CHANS  2  // repeat data writes for additional channels
 
-#define PWMCLK_CNTL   40
-#define PWMCLK_DIV    41
-
+#define PWMCTL_USEF2    (1<<13)
+#define PWMCTL_POLA2    (1<<12)
+#define PWMCTL_MODE2    (1<<9)
+#define PWMCTL_PWEN2    (1<<8)
+#define PWMCTL_CLRF1    (1<<6)
+#define PWMCTL_USEF1    (1<<5)
 #define PWMCTL_MODE1    (1<<1)
 #define PWMCTL_PWEN1    (1<<0)
-#define PWMCTL_CLRF   (1<<6)
-#define PWMCTL_USEF1    (1<<5)
 
 #define PWMDMAC_ENAB    (1<<31)
 #define PWMDMAC_PANIC(x)  ((x)<<8)
@@ -163,14 +171,21 @@
 #define PCM_INT_STC_A   (0x1c/4)
 #define PCM_GRAY    (0x20/4)
 
-#define PCMCLK_CNTL   38
-#define PCMCLK_DIV    39
+// PWM / PCM Clock Configuration
+#define CM_PCMCTL   38
+#define CM_PCMDIV   39
+#define CM_PWMCTL   40
+#define CM_PWMDIV   41
+
+#define CM_PWMCTL_PASSWD   (0x5A<<24)
+#define CM_PWMCTL_ENAB     (1<<4)
+#define CM_PWMCTL_SRC_OSC   1
+#define CM_PWMCTL_SRC_PLLD  6
+#define CM_PWMDIV_PASSWD        (0x5A<<24)
+#define CM_PWMDIV_FOR_OSC_58US  (1113<<12)
 
 #define PLLDFREQ_MHZ_DEFAULT  500
 #define PLLDFREQ_MHZ_PI4  750
-
-#define DELAY_VIA_PWM   0
-#define DELAY_VIA_PCM   1
 
 #define ROUNDUP(val, blksz) (((val)+((blksz)-1)) & ~(blksz-1))
 
@@ -216,7 +231,7 @@ typedef struct {
 // longest packet we support has 210 bits encoded (no 3 byte inst)
 // 11_1111_1111 0 0000_0000 0 0000_0000 0 0000_0000 0 00000_0000 0 00000_0000 1
 // preamble       addr1       addr2       inst1       inst2        chk_sum
-#define DCC_CODE_UI32_LEN     7  // 224 bits
+#define DCC_CODE_UI32_LEN     (7*PWM_FIFO_CHANS)  // 224 bits
 #define DCC_PCK_UI8_LEN       5  // uncoded packet length
 
 // DCC Intermediate Encoding
@@ -396,7 +411,6 @@ static uint8_t servo2gpio[MAX_SERVOS];
 static uint32_t gpiomode[MAX_SERVOS];
 static int restore_gpio_modes;
 static int is_debug;
-static int delay_hw = DELAY_VIA_PWM;
 
 static volatile uint32_t *pwm_reg;
 static volatile uint32_t *pcm_reg;
@@ -405,7 +419,6 @@ static volatile uint32_t *dma_base_reg;
 static volatile uint32_t *dma_reg;
 static volatile uint32_t *gpio_reg;
 
-static uint32_t plldfreq_mhz;
 static int dma_chan;
 static int invert = 0;
 static int num_samples;
@@ -438,7 +451,8 @@ static struct {
 static dcc_pkt_t dcc_pkt_tmp;
 static uint32_t dcc_dma_next_id = 0;
 
-  
+
+static void gpio_set(uint32_t gpio, int level);
 static void gpio_set_mode(uint32_t gpio, uint32_t mode);
 static void dcc_dma_make_cb(
   dcc_dma_entry_t *dcc_dma_buf, int this_id, int next_id);
@@ -459,7 +473,11 @@ udelay(int us)
 static void
 terminate(int dummy)
 {
-  // int i;
+  // clean up GPIOs
+  gpio_set(GPIO_FOR_MOT_ENB, 0);
+  gpio_set_mode(GPIO_FOR_MOT_ENB, GPIO_MODE_IN);
+  gpio_set_mode(GPIO_FOR_MOT_IN4, GPIO_MODE_IN);
+  gpio_set_mode(GPIO_FOR_MOT_IN3, GPIO_MODE_IN);
 
   // clean up dma regs
   if (dma_reg && mbox.virt_addr) {
@@ -471,12 +489,6 @@ terminate(int dummy)
     pwm_reg[PWM_CTL] = 0;
     udelay(10);
   }
-  // if (restore_gpio_modes) {
-  //   for (i = 0; i < MAX_SERVOS; i++) {
-  //     if (servo2gpio[i] != DMY)
-  //       gpio_set_mode(servo2gpio[i], gpiomode[i]);
-  //   }
-  // }
   if (mbox.virt_addr != NULL) {
     unmapmem(mbox.virt_addr, mbox.size);
     mem_unlock(mbox.handle, mbox.mem_ref);
@@ -519,7 +531,7 @@ gpio_set_mode(uint32_t gpio, uint32_t mode)
 }
 
 static void
-gpio_set(int gpio, int level)
+gpio_set(uint32_t gpio, int level)
 {
   if (level)
     gpio_reg[GPIO_SET0] = 1 << gpio;
@@ -682,6 +694,13 @@ dcc_make_line_code(dcc_pkt_t *pkt)
     pkt->line_code[line_code_idx] |= (DCC_CODE_ONE << line_code_shift);
     line_bits_rem -= DCC_CODE_ONE_LEN;
   }
+  // interleave line_code words for each fifo channel
+  // start from where first data is since line_code is packet from the end
+  int idx_shift = DCC_CODE_UI32_LEN - (DCC_CODE_UI32_LEN / PWM_FIFO_CHANS);
+  for (int idx=0; idx < DCC_CODE_UI32_LEN; idx++) {
+    // look ahead to find interleaved data word
+    pkt->line_code[idx] = pkt->line_code[(idx/PWM_FIFO_CHANS)+idx_shift];
+  }
 }
 
 static inline int
@@ -780,19 +799,22 @@ dcc_dma_hw_config(dcc_dma_entry_t *dcc_dma_buf)
   }
   pwm_reg[PWM_CTL] = 0;
   udelay(10);
-  clk_reg[PWMCLK_CNTL] = 0x5A000006;    // Source=PLLD (500MHz or 750MHz on Pi4)
+  // Configure PWM clock source at Clock Manager
+  clk_reg[CM_PWMCTL] = CM_PWMCTL_PASSWD | CM_PWMCTL_SRC_OSC;
   udelay(100);
-  clk_reg[PWMCLK_DIV] = 0x5A000000 | (plldfreq_mhz<<12);  // set pwm div to give 1MHz
+  clk_reg[CM_PWMDIV] = CM_PWMDIV_PASSWD | CM_PWMDIV_FOR_OSC_58US;
   udelay(100);
-  clk_reg[PWMCLK_CNTL] = 0x5A000016;    // Source=PLLD and enable
+  clk_reg[CM_PWMCTL] = CM_PWMCTL_PASSWD | CM_PWMCTL_SRC_OSC | CM_PWMCTL_ENAB;
   udelay(100);
-  pwm_reg[PWM_RNG1] = PWM_FIFO_WIDTH;   // Range=FIFO width for serializer mode
+  // Configure PWM FIFO for PWM0 (ch1) & PWM1 (ch2) polarity flipped
+  pwm_reg[PWM_RNG1] = PWM_FIFO_WIDTH;  // Range=FIFO width for serializer mode
   udelay(10);
   pwm_reg[PWM_DMAC] = PWMDMAC_ENAB | PWMDMAC_PANIC(2) | PWMDMAC_DREQ(4);
   udelay(10);
-  pwm_reg[PWM_CTL] = PWMCTL_CLRF; // clear fifo
+  pwm_reg[PWM_CTL] = PWMCTL_CLRF1;  // clear fifo
   udelay(10);
-  pwm_reg[PWM_CTL] = PWMCTL_USEF1 | PWMCTL_PWEN1 | PWMCTL_MODE1;    // ch 1 fifo, enable, serializer mode
+  pwm_reg[PWM_CTL] = PWMCTL_USEF1 | PWMCTL_PWEN1 | PWMCTL_MODE1 |\
+                     PWMCTL_USEF2 | PWMCTL_PWEN2 | PWMCTL_MODE2 | PWMCTL_POLA2;
   udelay(10);
 
   // Initialise the DMA
@@ -873,8 +895,12 @@ do_debug(void)
 static void
 go_go_go(void)
 {
-  // setup gpio 18 output for pwm0 (ch 1)
-  gpio_set_mode(18, GPIO_MODE_ALT5);
+  // setup GPIOs
+  gpio_set(GPIO_FOR_MOT_ENB, 0);
+  gpio_set_mode(GPIO_FOR_MOT_ENB, GPIO_MODE_OUT);
+  gpio_set(GPIO_FOR_MOT_ENB, 1);
+  gpio_set_mode(GPIO_FOR_MOT_IN4, GPIO_MODE_ALT5);
+  gpio_set_mode(GPIO_FOR_MOT_IN3, GPIO_MODE_ALT5);
 
   // start with debug info
   if (is_debug) {
@@ -1057,14 +1083,6 @@ get_model_and_revision(void)
   else
     gpio_cfg = 3;
 
-  if (bcm_host_is_model_pi4()) {
-    plldfreq_mhz = PLLDFREQ_MHZ_PI4;
-    dma_chan = DMA_CHAN_PI4;
-  } else {
-    plldfreq_mhz = PLLDFREQ_MHZ_DEFAULT;
-    dma_chan = DMA_CHAN_DEFAULT;
-  }
-
   periph_virt_base = bcm_host_get_peripheral_address();
   dram_phys_base = bcm_host_get_sdram_address();
   periph_phys_base = 0x7e000000;
@@ -1174,7 +1192,6 @@ main(int argc, char **argv)
   }
 
   printf("GPIO configuration:            %s\n", gpio_desc[gpio_cfg]);
-  printf("Using hardware:                %s\n", delay_hw == DELAY_VIA_PWM ? "PWM" : "PCM");
   printf("Using DMA channel:         %7d\n", dma_chan);
   printf("\n");
 
@@ -1232,14 +1249,12 @@ main(int argc, char **argv)
          0,
          mem_virt_to_phys(&(dcc_dma_buf[0].dma_cb)),
          (uint32_t)dcc_dma_buf[0].dma_cb.next);
-  printf("0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n0x%x\n",
-         dcc_dma_buf[0].dcc_pkt.line_code[0],
-         dcc_dma_buf[0].dcc_pkt.line_code[1],
-         dcc_dma_buf[0].dcc_pkt.line_code[2],
-         dcc_dma_buf[0].dcc_pkt.line_code[3],
-         dcc_dma_buf[0].dcc_pkt.line_code[4],
-         dcc_dma_buf[0].dcc_pkt.line_code[5],
-         dcc_dma_buf[0].dcc_pkt.line_code[6]);
+  for (int i=0; i < DCC_CODE_UI32_LEN; i+=PWM_FIFO_CHANS){
+    for (int j=0; j < PWM_FIFO_CHANS; j++) {
+      printf("0x%x  ", dcc_dma_buf[0].dcc_pkt.line_code[i+j]);
+    }
+    printf("\n");
+  }
   dcc_dma_hw_config(dcc_dma_buf);
 
   unlink(DEVFILE);
